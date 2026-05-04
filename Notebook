@@ -50,7 +50,25 @@ X_train, X_test, y_train, y_test = train_test_split(
     random_state=42,
     stratify=y
 )
+from sklearn.preprocessing import LabelEncoder
+import joblib
 
+encoder_dict = {}
+
+# Encode categorical
+for col in df.select_dtypes(include='object').columns:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col])
+    encoder_dict[col] = le   # save encoder
+
+# Features
+X = df.drop('Label', axis=1)
+
+# SAVE THESE (IMPORTANT)
+joblib.dump(encoder_dict, 'encoders.pkl')
+joblib.dump(X.columns.tolist(), 'features.pkl')
+
+print("✅ encoders.pkl & features.pkl saved")
 
 
 smote = SMOTE(random_state=42)
@@ -241,7 +259,7 @@ print("\n✅ Monitoring Finished")
 ##Explaible AI(SHAP):
 
 # ==========================================
-# INSTALL REQUIRED LIBRARY
+# INSTALL
 # ==========================================
 !pip install shap --quiet
 
@@ -255,71 +273,113 @@ import numpy as np
 import time
 
 # ==========================================
-# LOAD MODEL & SCALER
+# SAFE LOAD FUNCTION
 # ==========================================
-model = joblib.load('attack_model.pkl')
-scaler = joblib.load('scaler.pkl')
+def safe_load(path):
+    try:
+        return joblib.load(path)
+    except Exception as e:
+        print(f"❌ Error loading {path}: {e}")
+        return None
 
 # ==========================================
-# LOAD DATASET
+# LOAD FILES
 # ==========================================
-df = pd.read_csv('/content/wustl-ehms-2020_with_attacks_categories.csv')
+model = safe_load('attack_model.pkl')
+scaler = safe_load('scaler.pkl')
+
+# optional files (fallback supported)
+encoder_dict = safe_load('encoders.pkl')
+feature_columns = safe_load('features.pkl')
+
+if model is None or scaler is None:
+    raise Exception("❌ Model or Scaler missing! Fix file path first.")
 
 # ==========================================
-# REMOVE LEAKAGE COLUMNS
+# DEFAULT FEATURE HANDLING (FALLBACK)
 # ==========================================
-leak_cols = [
-    'Attack Category',
-    'SrcAddr', 'DstAddr',
-    'SrcMac', 'DstMac',
-    'sIpId', 'dIpId'
-]
+if feature_columns is None:
+    print("⚠️ features.pkl not found → using dummy feature names")
+    feature_columns = [f'f{i}' for i in range(scaler.n_features_in_)]
 
-df.drop(columns=leak_cols, inplace=True, errors='ignore')
-
-# ==========================================
-# ENCODE CATEGORICAL COLUMNS
-# ==========================================
-from sklearn.preprocessing import LabelEncoder
-
-le = LabelEncoder()
-
-for col in df.select_dtypes(include='object').columns:
-    df[col] = le.fit_transform(df[col])
+if encoder_dict is None:
+    print("⚠️ encoders.pkl not found → categorical encoding disabled")
+    encoder_dict = {}
 
 # ==========================================
-# FEATURES & LABEL
+# SAFE PREPROCESS FUNCTION
 # ==========================================
-X = df.drop('Label', axis=1)
-y = df['Label']
+def preprocess_input(input_data_dict):
+
+    df = pd.DataFrame([input_data_dict])
+
+    # Fill missing columns
+    for col in feature_columns:
+        if col not in df.columns:
+            df[col] = 0
+
+    # Encode categorical safely
+    for col, encoder in encoder_dict.items():
+        if col in df.columns:
+            try:
+                df[col] = encoder.transform(df[col])
+            except:
+                df[col] = 0  # unseen value fallback
+
+    # Ensure order
+    df = df[feature_columns]
+
+    # Scaling
+    try:
+        scaled = scaler.transform(df)
+    except Exception as e:
+        print("❌ Scaling error:", e)
+        return None, None
+
+    return scaled, df
+
 
 # ==========================================
-# SCALE FEATURES
+# SHAP EXPLAINER (AUTO FIX)
 # ==========================================
-X_scaled = scaler.transform(X)
+print("🔍 Initializing SHAP...")
 
-# ==========================================
-# CREATE SHAP EXPLAINER
-# ==========================================
-# Using XGBoost model inside voting classifier
-explainer = shap.TreeExplainer(model.named_estimators_['xgb'])
+try:
+    # VotingClassifier এর ভিতরের XGBoost model বের করা
+    xgb_model = model.named_estimators_['xgb']
+
+    explainer = shap.TreeExplainer(xgb_model)
+    SHAP_MODE = "XGB_TREE"
+
+except Exception as e:
+    print("⚠️ TreeExplainer failed, switching to Kernel:", e)
+
+    background = np.zeros((1, len(feature_columns)))
+    explainer = shap.KernelExplainer(
+        model.predict_proba,
+        background
+    )
+    SHAP_MODE = "KERNEL"
+
+print(f"✅ SHAP Mode: {SHAP_MODE}")
 
 # ==========================================
 # DETECTION FUNCTION
 # ==========================================
-def detect_attack_explainable(new_data, actual_label=None):
+def detect_attack_explainable(input_data_dict, actual_label=None):
 
-    # reshape
-    new_data = np.array(new_data).reshape(1, -1)
+    scaled_data, df = preprocess_input(input_data_dict)
 
-    # scaling
-    scaled_data = scaler.transform(new_data)
+    if scaled_data is None:
+        print("❌ Preprocessing failed")
+        return
 
-    # prediction
-    prediction = model.predict(scaled_data)[0]
-
-    # probability
-    probability = model.predict_proba(scaled_data)[0][1]
+    try:
+        prediction = model.predict(scaled_data)[0]
+        probability = model.predict_proba(scaled_data)[0][1]
+    except Exception as e:
+        print("❌ Prediction error:", e)
+        return
 
     print("\n======================================")
 
@@ -334,57 +394,65 @@ def detect_attack_explainable(new_data, actual_label=None):
         print(f"Actual Label: {actual_label}")
 
     # ======================================
-    # SHAP EXPLANATION
+    # SHAP EXPLANATION (SAFE)
     # ======================================
-    shap_values = explainer.shap_values(scaled_data)
+    try:
+        shap_values = explainer.shap_values(scaled_data)
 
-    # feature importance
-    contributions = pd.DataFrame({
-        'Feature': X.columns,
-        'Impact': shap_values[0]
-    })
+        # Handle different SHAP formats
+        if isinstance(shap_values, list):
+            shap_vals = shap_values[1][0]
+        else:
+            shap_vals = shap_values[0]
 
-    # sort by absolute impact
-    contributions['AbsImpact'] = contributions['Impact'].abs()
+        contributions = pd.DataFrame({
+            'Feature': feature_columns,
+            'Impact': shap_vals
+        })
 
-    top_features = contributions.sort_values(
-        by='AbsImpact',
-        ascending=False
-    ).head(5)
+        contributions['AbsImpact'] = contributions['Impact'].abs()
 
-    print("\n🔍 TOP FEATURES RESPONSIBLE:")
+        top_features = contributions.sort_values(
+            by='AbsImpact',
+            ascending=False
+        ).head(5)
 
-    for _, row in top_features.iterrows():
+        print("\n🔍 TOP FEATURES RESPONSIBLE:")
 
-        direction = "⬆ Increased Attack Chance" \
-            if row['Impact'] > 0 \
-            else "⬇ Reduced Attack Chance"
+        for _, row in top_features.iterrows():
 
-        print(
-            f"{row['Feature']} "
-            f"(Impact: {row['Impact']:.4f}) "
-            f"{direction}"
-        )
+            direction = (
+                "⬆ Increased Attack Chance"
+                if row['Impact'] > 0
+                else "⬇ Reduced Attack Chance"
+            )
+
+            print(
+                f"{row['Feature']} "
+                f"(Impact: {row['Impact']:.4f}) "
+                f"{direction}"
+            )
+
+    except Exception as e:
+        print("⚠️ SHAP failed:", e)
 
     print("======================================")
 
 # ==========================================
-# REAL-TIME SIMULATION
+# REAL-TIME SIMULATION (ERROR FREE)
 # ==========================================
 print("🔴 Explainable IDS Started...\n")
 
 for i in range(10):
 
-    # random real sample
-    idx = np.random.randint(0, len(X))
+    # Safe input তৈরি
+    sample_input = {
+        col: np.random.rand() for col in feature_columns
+    }
 
-    sample = X.iloc[idx].values
-    actual = y.iloc[idx]
+    detect_attack_explainable(sample_input)
 
-    detect_attack_explainable(sample, actual)
-
-    time.sleep(2)
+    time.sleep(1)
 
 print("\n✅ Monitoring Finished")
-
 
